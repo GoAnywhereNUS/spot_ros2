@@ -83,6 +83,7 @@ import spot_driver.robot_command_util as robot_command_util
 # DEBUG/RELEASE: RELATIVE PATH NOT WORKING IN DEBUG
 # Release
 from spot_driver.ros_helpers import TriggerServiceWrapper, get_from_env_and_fall_back_to_param
+from spot_driver.teleop_funcs import *
 from spot_msgs.action import (  # type: ignore
     ArmSurfaceContact,
     ExecuteDance,
@@ -617,6 +618,12 @@ class SpotROS(Node):
         )
         self.has_arm_pub.publish(Bool(data=self.has_arm))
 
+        if self.spot_wrapper is not None:
+            self.teleop_funcs = TeleopFuncs(
+                spot_wrapper=self.spot_wrapper,
+                movement_query_fn=None,
+            )
+
         # Status Publishers #
         self.dynamic_broadcaster: tf2_ros.TransformBroadcaster = tf2_ros.TransformBroadcaster(self)
         self.metrics_pub: Publisher = self.create_publisher(Metrics, "status/metrics", 1)
@@ -627,6 +634,9 @@ class SpotROS(Node):
         self.create_subscription(Pose, "body_pose", self.body_pose_callback, 1, callback_group=self.group)
 
         self.create_trigger_services()
+
+        if self.spot_wrapper is not None:
+            self.create_subscription(Joy, "/joy", self.teleop_funcs.handle_joy, 1, callback_group=self.group)
 
         if self.has_arm:
             self.create_subscription(

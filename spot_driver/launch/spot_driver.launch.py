@@ -115,6 +115,38 @@ def launch_setup(context: LaunchContext, ld: LaunchDescription) -> None:
     )
     ld.add_action(object_sync_node)
 
+    config_filepath = '/data/system/driver_ws/src/spot_ros2/spot_driver/config/buttercup_teleop.yaml'
+    joy_node = Node(
+        package='joy', executable='joy_node', name='joy_node',
+        parameters=[{
+            'device_id': 0,
+            'deadzone': 0.3,
+            'autorepeat_rate': 20.0,
+        }, config_filepath]
+    )
+    ld.add_action(joy_node)
+
+    teleop_node = Node(
+        package='teleop_twist_joy', executable='teleop_node',
+        name='teleop_twist_joy_node',
+        parameters=[config_filepath, {'publish_stamped_twist': False}],
+        remappings={('/cmd_vel', '/bluetooth_teleop/cmd_vel')},
+    )
+    ld.add_action(teleop_node)
+
+    config_locks = '/data/system/driver_ws/src/spot_ros2/spot_driver/config/twist_mux_locks.yaml'
+    config_topics = '/data/system/driver_ws/src/spot_ros2/spot_driver/config/twist_mux_topics.yaml'
+    twist_mux_node = Node(
+        package='twist_mux',
+        executable='twist_mux',
+        output='screen',
+        remappings={('/cmd_vel_out', '/spot/cmd_vel')},
+        parameters=[
+            {'use_sim_time': False},
+            config_topics]
+    )
+    ld.add_action(twist_mux_node)
+
     robot_description = Command(
         [
             PathJoinSubstitution([FindExecutable(name="xacro")]),
