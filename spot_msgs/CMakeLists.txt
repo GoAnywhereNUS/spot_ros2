@@ -110,6 +110,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "action/NavigateTo.action"
   "action/RobotCommand.action"
   "action/Trajectory.action"
+  "action/TrajectoryMulti.action"
   "action/Manipulation.action"
   DEPENDENCIES
     bosdyn_api_msgs

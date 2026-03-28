@@ -3,6 +3,13 @@ from bosdyn.api.spot import robot_command_pb2 as spot_command_pb2
 from enum import IntEnum
 from threading import Lock
 import time
+import numpy as np
+
+from rclpy.duration import Duration
+
+from bosdyn.api import arm_command_pb2
+from bosdyn_msgs.msg import ArmVelocityCommandRequest
+from bosdyn_msgs.conversions import convert
 
 class LocomotionHint(IntEnum):
     HINT_AUTO = 1
@@ -25,6 +32,24 @@ class StairsMode(IntEnum):
     @classmethod
     def _missing_(cls, value):
         return cls.STAIRS_MODE_AUTO
+
+class GripperPoseType(IntEnum):
+    NO_POSE = 1
+    LOOK_FORWARD = 2
+    LOOK_LEFT = 3
+    LOOK_RIGHT = 4
+    LOOK_FORWARD_HIGH = 5
+
+    @classmethod
+    def _missing_(cls, value):
+        return cls.NO_POSE
+
+gripper_poses = {
+    GripperPoseType.LOOK_FORWARD : (np.array([0.5, 0.0, 0.6]), np.array([0., 0., 0., 1.])),
+    GripperPoseType.LOOK_LEFT : (np.array([0.5, 0.25, 0.6]), np.array([0., 0., 0.5, 0.866])),
+    GripperPoseType.LOOK_RIGHT : (np.array([0.5, -0.25, 0.6]), np.array([0., 0., -0.5, 0.866])),
+    GripperPoseType.LOOK_FORWARD_HIGH : (np.array([0.5, 0.0, 0.9]), np.array([0., 0., 0., 1.])),
+}
 
 class TeleopFuncs:
     """
@@ -67,7 +92,11 @@ class TeleopFuncs:
         ]
         self.stair_mode_idx = 0
 
-    def handle_joy(self, joy_msg):
+    def handle_joy(self, joy_msg, node_time):
+        enable_hand = joy_msg.buttons[5] == 1
+        if enable_hand:
+            self._handle_arm_movement(joy_msg, node_time)
+
         enable = joy_msg.axes[2] < -0.99
         if enable:
             with self.lock:
@@ -79,6 +108,7 @@ class TeleopFuncs:
             toggle_sit_stand = False
             toggle_locomotion_mode = False
             toggle_stairs_mode = False
+            set_gripper_pose_mode = False
 
             with self.lock:
                 # Check requests that will trigger robot actions with refractory period.
@@ -87,11 +117,21 @@ class TeleopFuncs:
                     toggle_sit_stand = joy_msg.axes[7] > 0.9 # Sit/stand request
                     toggle_locomotion_mode = joy_msg.axes[6] > 0.9 # Locomotion mode change request
                     toggle_stairs_mode = joy_msg.axes[6] < -0.9 # Stairs mode change request
+
+                    set_gripper_pose_mode = any(joy_msg.buttons[:4])
+                    if joy_msg.buttons[3] and joy_msg.buttons[0]:
+                        gripper_pose = GripperPoseType.LOOK_FORWARD_HIGH
+                    elif joy_msg.buttons[3]:
+                        gripper_pose = GripperPoseType.LOOK_FORWARD
+                    elif joy_msg.buttons[0]:
+                        gripper_pose = GripperPoseType.NO_POSE
+
                 self.pause = (
                     toggle_power 
                     or toggle_sit_stand 
                     or toggle_locomotion_mode 
                     or toggle_stairs_mode
+                    or set_gripper_pose_mode
                 )
 
             # Handle mode change requests (only highest priority request)
@@ -103,6 +143,8 @@ class TeleopFuncs:
                 self._handle_toggle_locomotion_mode()
             elif toggle_stairs_mode:
                 self._handle_toggle_stairs_mode()
+            elif set_gripper_pose_mode:
+                self._handle_gripper_pose(gripper_pose)
 
     def _handle_toggle_power(self):
         print("Received power on/off command")
@@ -176,3 +218,55 @@ class TeleopFuncs:
 
         with self.lock:
             self.pause = False
+
+    def _handle_gripper_pose(self, gripper_pose_type):
+        if gripper_pose_type is GripperPoseType.NO_POSE:
+            self.spot_wrapper.spot_arm.arm_stow()
+        else:
+            pos, ori = gripper_poses[gripper_pose_type]
+            data = np.concatenate([pos, ori])
+            self.spot_wrapper.spot_arm.hand_pose(
+                x=pos[0], y=pos[1], z=pos[2],
+                qx=ori[0], qy=ori[1], qz=ori[2], qw=ori[3],
+            )
+            self.spot_wrapper.spot_arm.gripper_open()
+
+    def _handle_arm_movement(self, joy_msg, node_time):
+        move_in = joy_msg.axes[1] < -0.8
+        move_out = joy_msg.axes[1] > 0.8
+        move_down = joy_msg.axes[4] < -0.8
+        move_up = joy_msg.axes[4] > 0.8
+        turn_ccw = joy_msg.axes[3] > 0.8
+        turn_cw = joy_msg.axes[3] < -0.8
+
+        v_r = 0.0
+        v_r = -0.7 if move_in else v_r
+        v_r = 0.7 if move_out else v_r
+
+        v_z = 0.0
+        v_z = -0.7 if move_down else v_z
+        v_z = 0.7 if move_up else v_z
+
+        v_theta = 0.0
+        v_theta = 0.7 if turn_ccw else v_theta
+        v_theta = -0.7 if turn_cw else v_theta
+
+        msg = ArmVelocityCommandRequest()
+        msg.end_time = (node_time + Duration(seconds=0.4)).to_msg()
+        msg.command.cylindrical_velocity.linear_velocity.r = v_r
+        msg.command.cylindrical_velocity.linear_velocity.z = v_z
+        msg.command.cylindrical_velocity.linear_velocity.theta = v_theta
+        msg.command.cylindrical_velocity.max_linear_velocity.data = 0.5
+        msg.command.command_choice = 1
+        msg.has_field = 16
+
+        try:
+            proto_command = arm_command_pb2.ArmVelocityCommand.Request()
+            convert(msg, proto_command)
+            result, message = self.spot_wrapper.spot_arm.handle_arm_velocity(
+                arm_velocity_command=proto_command, cmd_duration=0.2
+            )
+            if not result:
+                print(f"Failed to execute arm velocity command: {message}")
+        except Exception as e:
+            print(str(e))

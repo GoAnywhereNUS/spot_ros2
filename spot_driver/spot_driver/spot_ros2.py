@@ -39,7 +39,7 @@ from bosdyn.api.geometry_pb2 import Quaternion, SE2VelocityLimit
 from bosdyn.api.manipulation_api_pb2 import WalkGazeMode
 from bosdyn.api.spot import robot_command_pb2 as spot_command_pb2
 from bosdyn.api.spot.choreography_sequence_pb2 import Animation, ChoreographySequence, ChoreographyStatusResponse
-from bosdyn.client import math_helpers
+from bosdyn.client import frame_helpers, math_helpers
 from bosdyn.client.async_tasks import AsyncPeriodicQuery
 from bosdyn.client.exceptions import InternalServerError
 from bosdyn.client.lease import Lease, LeaseWallet
@@ -90,6 +90,7 @@ from spot_msgs.action import (  # type: ignore
     Manipulation,
     NavigateTo,
     Trajectory,
+    TrajectoryMulti,
 )
 from spot_msgs.action import (  # type: ignore
     RobotCommand as RobotCommandAction,
@@ -636,7 +637,7 @@ class SpotROS(Node):
         self.create_trigger_services()
 
         if self.spot_wrapper is not None:
-            self.create_subscription(Joy, "/joy", self.teleop_funcs.handle_joy, 1, callback_group=self.group)
+            self.create_subscription(Joy, "/joy", self.handle_joy_teleop, 1, callback_group=self.group)
 
         if self.has_arm:
             self.create_subscription(
@@ -701,6 +702,12 @@ class SpotROS(Node):
                 request,
                 response,
             ),
+            callback_group=self.group,
+        )
+        self.create_service(
+            Trigger,
+            "toggle_obstacle_avoidance",
+            lambda request, response: self.service_wrapper("toggle_obstacle_avoidance", self.handle_toggle_obstacle_avoidance, request, response),
             callback_group=self.group,
         )
         self.create_service(
@@ -1010,6 +1017,12 @@ class SpotROS(Node):
             self.handle_trajectory,
         )
         # spot_ros.trajectory_server.start()
+        self.arm_trajectory_server = ActionServer(
+            self,
+            TrajectoryMulti,
+            "trajectory_arm",
+            self.handle_trajectory_arm,
+        )
 
         self.create_service(
             RobotCommandService,
@@ -1982,6 +1995,25 @@ class SpotROS(Node):
             response.message = f"Error: {e}"
             return response
 
+    def handle_toggle_obstacle_avoidance(self, request, response):
+        if self.spot_wrapper is None:
+            response.success = False
+            response.message = "Spot wrapper is undefined"
+            return response
+
+        try:
+            mobility_params = self.spot_wrapper.get_mobility_params()
+            vision_body_avoidance = mobility_params.obstacle_params.disable_vision_body_obstacle_avoidance
+            mobility_params.obstacle_params.disable_vision_body_obstacle_avoidance = not vision_body_avoidance
+            self.spot_wrapper.set_mobility_params(mobility_params)
+            response.success = True
+            response.message = "Success"
+            return response
+        except Exception as e:
+            response.success = False
+            response.message = f"Error: {e}"
+            return response
+
     def _process_feedback_status(self, status: int) -> Optional[GoalResponse]:
         if status == RobotCommandFeedbackStatusStatus.STATUS_UNKNOWN:
             return GoalResponse.IN_PROGRESS
@@ -2537,6 +2569,159 @@ class SpotROS(Node):
             result.success = True
             result.message = "Waited until trajectory should be complete"
             goal_handle.succeed()
+        return result
+
+    def handle_trajectory_arm(self, goal_handle: ServerGoalHandle) -> Optional[TrajectoryMulti.Result]:
+        """
+        ROS actionserver execution handler to handle requests to move the end-effector to a sequence
+        of 6-DoF poses. The end-effector frame is currently defined as the standard forward-facing
+        frame attached to the tip of the gripper's bottom jaw.
+        """
+
+        result: Optional[TrajectoryMulti.Result] = None
+
+        trajectory = []
+        duration_secs_accum = 0.0
+        for pose, dur in zip(goal_handle.request.target_poses, goal_handle.request.target_durations):
+            duration_secs = float(dur.sec) + float(dur.nanosec)*1e-9
+            if duration_secs <= 0.0:
+                goal_handle.abort()
+                result = TrajectoryMulti.Result()
+                result.success = False
+                result.message = "duration must be larger than 0"
+                return result
+
+            duration_secs_accum += duration_secs
+            trajectory.append((
+                [pose.pose.position.x, pose.pose.position.y, pose.pose.position.z],
+                [pose.pose.orientation.w, pose.pose.orientation.x, pose.pose.orientation.y, pose.pose.orientation.z],
+                duration_secs_accum
+            ))
+
+        if self.spot_wrapper is None:
+            goal_handle.abort()
+            result = TrajectoryMulti.Result()
+            result.success = False
+            result.message = "Spot wrapper is None"
+            return result
+        
+        body_T_task = goal_handle.request.body_to_task_frame
+
+        odom_T_grav_body = self.spot_wrapper.get_robot_state(frame_helpers.ODOM_FRAME_NAME, frame_helpers.GRAV_ALIGNED_BODY_FRAME_NAME)
+        body_T_task_frame = math_helpers.SE3Pose(
+            x=body_T_task.translation.x, y=body_T_task.translation.y, z=body_T_task.translation.z,
+            rot=math_helpers.Quat(w=body_T_task.rotation.w, x=body_T_task.rotation.x, y=body_T_task.rotation.y, z=body_T_task.rotation.z)
+        )
+        odom_T_task_frame = odom_T_grav_body * body_T_task_frame
+        # odom_T_task_frame = odom_T_grav_body * math_helpers.SE3Pose(x=0.9, y=0, z=0.4, rot=math_helpers.Quat(1, 0, 0, 0))
+        wr1_to_tool_frame = math_helpers.SE3Pose(0.23589, 0, -0.03943, math_helpers.Quat(1, 0, 0, 0))
+        
+        if goal_handle.request.control == 0:    # Impedance control
+            # impedance_stiffness_diagonal = [300, 300, 300, 60, 60, 60]
+            # impedance_damping_diagonal = [2.5, 2.5, 2.5, 1.0, 1.0, 1.0]
+            impedance_stiffness_diagonal = goal_handle.request.impedance_stiffness_diagonal
+            impedance_damping_diagonal = goal_handle.request.impedance_damping_diagonal
+
+            self.get_logger().info("Odom task:" + str(odom_T_task_frame))
+            self.get_logger().info("Wrist tool:"+ str(wr1_to_tool_frame))
+            self.get_logger().info(str(trajectory))
+            self.get_logger().info(str(impedance_stiffness_diagonal))
+            self.get_logger().info(str(impedance_damping_diagonal))
+
+            cmd_id = self.spot_wrapper.spot_arm.make_impedance_trajectory_command(
+                trajectory,
+                odom_T_task_frame,
+                wr1_to_tool_frame,
+                impedance_stiffness_diagonal=impedance_stiffness_diagonal,
+                impedance_damping_diagonal=impedance_damping_diagonal,
+                blocking=False,
+            )
+        elif goal_handle.request.control == 1:  # Position control
+            raise NotImplementedError
+        else:
+            goal_handle.abort()
+            result = TrajectoryMulti.Result()
+            result.success = False
+            result.message = "Invalid control type"
+            return result
+        
+        rate = self.create_rate(self.get_parameter("poll_rate").value)
+        result = TrajectoryMulti.Result()
+        result.success = False
+        try:
+            while rclpy.ok():
+                feedback = TrajectoryMulti.Feedback()
+                feedback.feedback = "No feedback received."
+
+                if goal_handle.is_cancel_requested:
+                    self.get_logger().warn('Cancelling goal...')
+                    self.spot_wrapper.stop()
+                    goal_handle.canceled()
+                    result.message = "Canceled."
+                    break
+                
+                if goal_handle.is_active:                                   
+                    cmd_feedback = self.spot_wrapper.spot_arm.get_arm_command_feedback(cmd_id)
+
+                    if cmd_feedback.HasField("arm_cartesian_feedback"):
+                        if cmd_feedback.arm_cartesian_feedback.status == arm_command_pb2.ArmCartesianCommand.Feedback.STATUS_TRAJECTORY_COMPLETE:
+                            result.success = True
+                            result.message = "Trajectory completed."
+                            break
+                        elif (
+                            cmd_feedback.arm_cartesian_feedback.status == arm_command_pb2.ArmCartesianCommand.Feedback.STATUS_TRAJECTORY_STALLED 
+                            or cmd_feedback.feedback.synchronized_feedback.arm_command_feedback.arm_cartesian_feedback.status == arm_command_pb2.ArmCartesianCommand.Feedback.STATUS_TRAJECTORY_CANCELLED
+                        ):
+                            result.success = False
+                            result.message = "Stalled or cancelled, possibly blocked."
+                            break
+                        elif cmd_feedback.arm_cartesian_feedback.status == arm_command_pb2.ArmCartesianCommand.Feedback.STATUS_IN_PROGRESS:
+                            feedback.feedback = "Trajectory in progress."
+                    elif cmd_feedback.HasField("arm_gaze_feedback"):
+                        if cmd_feedback.arm_gaze_feedback.status == arm_command_pb2.GazeCommand.Feedback.STATUS_TRAJECTORY_COMPLETE:
+                            result.success = True
+                            result.message = "Trajectory completed."
+                            break
+                        elif cmd_feedback.arm_gaze_feedback.status == arm_command_pb2.GazeCommand.Feedback.STATUS_TOOL_TRAJECTORY_STALLED:
+                            result.success = False
+                            result.message = "Stalled, possibly blocked."
+                            break
+                        elif cmd_feedback.arm_gaze_feedback.status == arm_command_pb2.GazeCommand.Feedback.STATUS_IN_PROGRESS:
+                            feedback.feedback = "Trajectory in progress."
+                    elif cmd_feedback.HasField("arm_impedance_feedback"):
+                        if cmd_feedback.arm_impedance_feedback.status == arm_command_pb2.ArmImpedanceCommand.Feedback.STATUS_TRAJECTORY_COMPLETE:
+                            result.success = True
+                            result.message = "Trajectory completed."
+                            break
+                        elif (
+                            cmd_feedback.arm_impedance_feedback.status == arm_command_pb2.ArmImpedanceCommand.Feedback.STATUS_TRAJECTORY_STALLED
+                            or cmd_feedback.arm_impedance_feedback.status == arm_command_pb2.ArmImpedanceCommand.Feedback.STATUS_TRAJECTORY_CANCELLED
+                        ):
+                            result.success = False
+                            result.message = "Stalled or cancelled, possibly blocked."
+                            break
+                        elif cmd_feedback.arm_impedance_feedback.status == arm_command_pb2.ArmImpedanceCommand.Feedback.STATUS_IN_PROGRESS:
+                            feedback.feedback = "Trajectory in progress."
+
+                    goal_handle.publish_feedback(feedback)
+                    rate.sleep()
+        except Exception as e:
+            self.get_logger().error(f"Exception: {type(e)} - {e}")
+            if result is not None:
+                result.success = False
+            result.message = f"Exception: {type(e)} - {e}"
+
+
+        feedback = TrajectoryMulti.Feedback()
+        if result.success:
+            feedback.feedback = "Trajectory complete: reached goal"
+            goal_handle.publish_feedback(feedback)
+            goal_handle.succeed()
+        else:
+            feedback.feedback = "Trajectory incomplete."
+            goal_handle.publish_feedback(feedback)
+            goal_handle.abort()
+
         return result
 
     def handle_trajectory(self, goal_handle: ServerGoalHandle) -> Optional[Trajectory.Result]:
@@ -3176,6 +3361,12 @@ class SpotROS(Node):
                     self.get_logger().error("Error:{}".format(e))
                     pass
             self.mobility_params_pub.publish(mobility_params_msg)
+
+    def handle_joy_teleop(self, joy_msg):
+        self.teleop_funcs.handle_joy(
+            joy_msg,
+            self.get_clock().now()
+        )
 
     def destroy_node(self) -> None:
         self.get_logger().info("Shutting down ROS driver for Spot")
