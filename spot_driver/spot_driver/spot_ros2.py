@@ -64,7 +64,7 @@ from bosdyn_msgs.msg import (
 )
 from geometry_msgs.msg import Pose, PoseStamped, TransformStamped, Twist
 from rclpy import Parameter
-from rclpy.action import ActionServer
+from rclpy.action import ActionServer, CancelResponse
 from rclpy.action.server import ServerGoalHandle
 from rclpy.callback_groups import CallbackGroup, MutuallyExclusiveCallbackGroup
 from rclpy.clock import Clock
@@ -1021,7 +1021,8 @@ class SpotROS(Node):
             self,
             TrajectoryMulti,
             "trajectory_arm",
-            self.handle_trajectory_arm,
+            execute_callback=self.handle_trajectory_arm,
+            cancel_callback=self.cancel_trajectory_arm,
         )
 
         self.create_service(
@@ -2658,7 +2659,7 @@ class SpotROS(Node):
                     self.spot_wrapper.stop()
                     goal_handle.canceled()
                     result.message = "Canceled."
-                    break
+                    return result
                 
                 if goal_handle.is_active:                                   
                     cmd_feedback = self.spot_wrapper.spot_arm.get_arm_command_feedback(cmd_id)
@@ -2723,6 +2724,10 @@ class SpotROS(Node):
             goal_handle.abort()
 
         return result
+
+    def cancel_trajectory_arm(self, goal_handle):
+        self.get_logger().info("Received cancel request")
+        return CancelResponse.ACCEPT
 
     def handle_trajectory(self, goal_handle: ServerGoalHandle) -> Optional[Trajectory.Result]:
         """ROS actionserver execution handler to handle receiving a request to move to a location"""
